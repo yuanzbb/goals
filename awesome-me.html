@@ -742,26 +742,7 @@
       status.appendChild(dot);
       status.appendChild(text);
 
-      const actions = document.createElement("div");
-      actions.className = "sync-actions";
-
-      const reloadBtn = document.createElement("button");
-      reloadBtn.type = "button";
-      reloadBtn.className = "sync-btn";
-      reloadBtn.textContent = "刷新数据";
-      reloadBtn.addEventListener("click", () => reloadFromCloud());
-
-      const syncBtn = document.createElement("button");
-      syncBtn.type = "button";
-      syncBtn.className = "sync-btn";
-      syncBtn.textContent = "立即同步";
-      syncBtn.addEventListener("click", () => pushToSupabase());
-
-      actions.appendChild(reloadBtn);
-      actions.appendChild(syncBtn);
-
       top.appendChild(status);
-      top.appendChild(actions);
       bar.appendChild(top);
     }
 
