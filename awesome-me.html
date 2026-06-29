@@ -416,13 +416,136 @@
       pointer-events: none;
       z-index: 9999;
     }
+
+    .sync-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 16px;
+      padding: 10px 14px;
+      border: 1px solid #ece8ff;
+      border-radius: 10px;
+      background: #faf9ff;
+      font-size: 13px;
+      color: #666;
+    }
+
+    .sync-bar-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .sync-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .sync-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #bbb;
+      flex-shrink: 0;
+    }
+
+    .sync-dot.synced { background: #2e9e4f; }
+    .sync-dot.syncing { background: #4a90d9; animation: sync-pulse 1s infinite; }
+    .sync-dot.error { background: #c0392b; }
+    .sync-dot.local { background: #d4a017; }
+
+    @keyframes sync-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+
+    .sync-actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .sync-btn {
+      border: 1px solid #ddd;
+      background: #fff;
+      color: #555;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .sync-btn:hover {
+      background: #f5f5f5;
+    }
+
+    .sync-panel {
+      margin-bottom: 16px;
+      padding: 14px 16px;
+      border: 1px solid #ece8ff;
+      border-radius: 10px;
+      background: #fff;
+      font-size: 13px;
+      color: #555;
+    }
+
+    .sync-panel label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 600;
+      color: #444;
+    }
+
+    .sync-panel input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 13px;
+    }
+
+    .sync-panel p {
+      margin: 10px 0 0;
+      line-height: 1.5;
+      color: #888;
+    }
+
+    .sync-panel a {
+      color: #4a90d9;
+    }
+
+    .sync-panel-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .boot-loading {
+      padding: 48px 0;
+      text-align: center;
+      color: #888;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
+  <div id="sync-bar"></div>
   <div id="app"></div>
 
   <script>
     const STORAGE_KEY = "goals-tracker:data";
+    const TOKEN_KEY = "goals-tracker:github-token";
+    const GITHUB = {
+      owner: "yuanzbb",
+      repo: "goals",
+      path: "data.json",
+      branch: "main"
+    };
     const SECTIONS = ["生活娱乐", "学习成长"];
     const STATUSES = ["待开始", "进行中", "已完成"];
 
@@ -452,16 +575,163 @@
       return { subgoal: "", desc: "", plans: [emptyPlan()] };
     }
 
-    let data = loadData();
+    let data = structuredClone(defaultData);
+    let dataSha = null;
+    let syncState = "loading";
+    let syncMessage = "正在从 GitHub 加载…";
+    let saveTimer = null;
+    let syncPanelOpen = false;
 
-    function loadData() {
+    function githubApiUrl() {
+      return "https://api.github.com/repos/" + GITHUB.owner + "/" + GITHUB.repo + "/contents/" + GITHUB.path + "?ref=" + GITHUB.branch;
+    }
+
+    function githubRawUrl() {
+      return "https://raw.githubusercontent.com/" + GITHUB.owner + "/" + GITHUB.repo + "/" + GITHUB.branch + "/" + GITHUB.path;
+    }
+
+    function getToken() {
+      return localStorage.getItem(TOKEN_KEY) || "";
+    }
+
+    function setToken(value) {
+      const trimmed = (value || "").trim();
+      if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
+      else localStorage.removeItem(TOKEN_KEY);
+    }
+
+    function authHeaders(token) {
+      return {
+        Accept: "application/vnd.github+json",
+        Authorization: "Bearer " + token,
+        "X-GitHub-Api-Version": "2022-11-28"
+      };
+    }
+
+    function toBase64Utf8(str) {
+      const bytes = new TextEncoder().encode(str);
+      let binary = "";
+      bytes.forEach((b) => { binary += String.fromCharCode(b); });
+      return btoa(binary);
+    }
+
+    function fromBase64Utf8(b64) {
+      const binary = atob(b64.replace(/\n/g, ""));
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    }
+
+    function loadLocalCache() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) return migrate(JSON.parse(raw));
       } catch (e) {
-        console.warn("读取本地数据失败，使用默认数据", e);
+        console.warn("读取本地缓存失败", e);
       }
-      return structuredClone(defaultData);
+      return null;
+    }
+
+    async function loadFromGitHub() {
+      const token = getToken();
+
+      if (token) {
+        try {
+          const res = await fetch(githubApiUrl(), { headers: authHeaders(token) });
+          if (res.ok) {
+            const meta = await res.json();
+            dataSha = meta.sha;
+            return migrate(JSON.parse(fromBase64Utf8(meta.content)));
+          }
+          if (res.status !== 404) {
+            throw new Error("GitHub API " + res.status);
+          }
+        } catch (e) {
+          console.warn("GitHub API 读取失败，尝试 Raw 地址", e);
+        }
+      }
+
+      try {
+        const res = await fetch(githubRawUrl() + "?t=" + Date.now());
+        if (res.ok) {
+          return migrate(await res.json());
+        }
+        if (res.status !== 404) {
+          throw new Error("Raw 读取失败 " + res.status);
+        }
+      } catch (e) {
+        console.warn("Raw 读取失败", e);
+      }
+
+      return loadLocalCache() || structuredClone(defaultData);
+    }
+
+    function setSyncState(state, message) {
+      syncState = state;
+      syncMessage = message || "";
+      renderSyncBar();
+    }
+
+    async function refreshSha() {
+      const token = getToken();
+      if (!token) return;
+      const res = await fetch(githubApiUrl(), { headers: authHeaders(token) });
+      if (res.ok) {
+        const meta = await res.json();
+        dataSha = meta.sha;
+      } else if (res.status === 404) {
+        dataSha = null;
+      } else {
+        throw new Error("获取文件版本失败 " + res.status);
+      }
+    }
+
+    async function pushToGitHub() {
+      const token = getToken();
+      if (!token) {
+        setSyncState("local", "仅保存在本机浏览器，设置 Token 后可跨设备同步");
+        return;
+      }
+
+      setSyncState("syncing", "正在同步到 GitHub…");
+
+      try {
+        if (!dataSha) await refreshSha();
+
+        const payload = {
+          message: "Update goals data",
+          content: toBase64Utf8(JSON.stringify(data, null, 2)),
+          branch: GITHUB.branch
+        };
+        if (dataSha) payload.sha = dataSha;
+
+        const res = await fetch(githubApiUrl(), {
+          method: "PUT",
+          headers: Object.assign({ "Content-Type": "application/json" }, authHeaders(token)),
+          body: JSON.stringify(payload)
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          if (res.status === 409) {
+            dataSha = null;
+            await refreshSha();
+            throw new Error("版本冲突，请刷新页面后重试");
+          }
+          throw new Error(errText || ("同步失败 " + res.status));
+        }
+
+        const result = await res.json();
+        dataSha = result.content.sha;
+        setSyncState("synced", "已同步到 GitHub，换设备打开同一链接即可看到");
+      } catch (e) {
+        console.error(e);
+        setSyncState("error", "同步失败：" + (e.message || "未知错误"));
+      }
+    }
+
+    function scheduleGitHubSave() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => pushToGitHub(), 1500);
     }
 
     function migrate(parsed) {
@@ -493,6 +763,134 @@
 
     function save() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      scheduleGitHubSave();
+    }
+
+    function renderSyncBar() {
+      const bar = document.getElementById("sync-bar");
+      if (!bar) return;
+      bar.innerHTML = "";
+
+      const top = document.createElement("div");
+      top.className = "sync-bar-top";
+
+      const status = document.createElement("div");
+      status.className = "sync-status";
+
+      const dot = document.createElement("span");
+      dot.className = "sync-dot";
+      if (syncState === "synced") dot.classList.add("synced");
+      else if (syncState === "syncing") dot.classList.add("syncing");
+      else if (syncState === "error") dot.classList.add("error");
+      else if (syncState === "local") dot.classList.add("local");
+
+      const text = document.createElement("span");
+      text.textContent = syncMessage;
+
+      status.appendChild(dot);
+      status.appendChild(text);
+
+      const actions = document.createElement("div");
+      actions.className = "sync-actions";
+
+      const settingsBtn = document.createElement("button");
+      settingsBtn.type = "button";
+      settingsBtn.className = "sync-btn";
+      settingsBtn.textContent = syncPanelOpen ? "收起设置" : "同步设置";
+      settingsBtn.addEventListener("click", () => {
+        syncPanelOpen = !syncPanelOpen;
+        renderSyncBar();
+      });
+
+      const syncBtn = document.createElement("button");
+      syncBtn.type = "button";
+      syncBtn.className = "sync-btn";
+      syncBtn.textContent = "立即同步";
+      syncBtn.addEventListener("click", () => pushToGitHub());
+
+      actions.appendChild(settingsBtn);
+      actions.appendChild(syncBtn);
+
+      top.appendChild(status);
+      top.appendChild(actions);
+      bar.appendChild(top);
+
+      if (syncPanelOpen) {
+        const panel = document.createElement("div");
+        panel.className = "sync-panel";
+
+        const label = document.createElement("label");
+        label.textContent = "GitHub Personal Access Token";
+        label.setAttribute("for", "github-token");
+
+        const input = document.createElement("input");
+        input.id = "github-token";
+        input.type = "password";
+        input.placeholder = "粘贴 Token（仅保存在本机浏览器）";
+        input.value = getToken();
+        input.autocomplete = "off";
+
+        const help = document.createElement("p");
+        help.innerHTML =
+          "在 GitHub → Settings → Developer settings → Personal access tokens 创建 Token，" +
+          "勾选 <strong>Contents</strong> 读写权限（公开仓库可用 <code>public_repo</code>）。" +
+          ' <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">去创建 Token</a>';
+
+        const panelActions = document.createElement("div");
+        panelActions.className = "sync-panel-actions";
+
+        const saveTokenBtn = document.createElement("button");
+        saveTokenBtn.type = "button";
+        saveTokenBtn.className = "sync-btn";
+        saveTokenBtn.textContent = "保存 Token";
+        saveTokenBtn.addEventListener("click", () => {
+          setToken(input.value);
+          setSyncState(getToken() ? "synced" : "local", getToken() ? "Token 已保存" : "Token 已清除");
+          if (getToken()) pushToGitHub();
+        });
+
+        const reloadBtn = document.createElement("button");
+        reloadBtn.type = "button";
+        reloadBtn.className = "sync-btn";
+        reloadBtn.textContent = "从 GitHub 重新加载";
+        reloadBtn.addEventListener("click", async () => {
+          setSyncState("loading", "正在重新加载…");
+          data = await loadFromGitHub();
+          render();
+          setSyncState("synced", "已从 GitHub 加载最新数据");
+        });
+
+        panelActions.appendChild(saveTokenBtn);
+        panelActions.appendChild(reloadBtn);
+
+        panel.appendChild(label);
+        panel.appendChild(input);
+        panel.appendChild(help);
+        panel.appendChild(panelActions);
+        bar.appendChild(panel);
+      }
+    }
+
+    async function boot() {
+      renderSyncBar();
+      document.getElementById("app").innerHTML = '<div class="boot-loading">正在加载目标数据…</div>';
+
+      try {
+        data = await loadFromGitHub();
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        if (getToken()) {
+          setSyncState("synced", "已从 GitHub 加载，修改后会自动同步");
+          if (!dataSha) scheduleGitHubSave();
+        } else {
+          setSyncState("local", "只读模式：可查看数据，设置 Token 后才能保存到云端");
+        }
+      } catch (e) {
+        console.error(e);
+        data = loadLocalCache() || structuredClone(defaultData);
+        setSyncState("error", "加载失败，已使用本地缓存");
+      }
+
+      render();
     }
 
     const DONE_ICONS = ["🏆", "🎉", "🌸", "⭐", "🎆"];
@@ -1553,7 +1951,7 @@
       if (e.key === "Escape") closeDescPopover();
     });
 
-    render();
+    boot();
   </script>
 </body>
 </html>
