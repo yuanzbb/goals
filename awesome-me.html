@@ -539,12 +539,11 @@
 
   <script>
     const STORAGE_KEY = "goals-tracker:data";
-    const TOKEN_KEY = "goals-tracker:github-token";
-    const GITHUB = {
-      owner: "yuanzbb",
-      repo: "goals",
-      path: "data.json",
-      branch: "main"
+    const SUPABASE = {
+      url: "https://vvyytjfcomxaabiuwntd.supabase.co",
+      key: "sb_publishable_vEJKvsiAKy1PhBYmhT-aSA_vVML5yid",
+      table: "app_state",
+      rowId: "main"
     };
     const SECTIONS = ["生活娱乐", "学习成长"];
     const STATUSES = ["待开始", "进行中", "已完成"];
@@ -576,49 +575,27 @@
     }
 
     let data = structuredClone(defaultData);
-    let dataSha = null;
     let syncState = "loading";
-    let syncMessage = "正在从 GitHub 加载…";
+    let syncMessage = "正在从云端加载…";
     let saveTimer = null;
-    let syncPanelOpen = false;
+    let lastSavedSnapshot = "";
+    let reloading = false;
 
-    function githubApiUrl() {
-      return "https://api.github.com/repos/" + GITHUB.owner + "/" + GITHUB.repo + "/contents/" + GITHUB.path + "?ref=" + GITHUB.branch;
+    function supabaseRestUrl(query) {
+      return SUPABASE.url + "/rest/v1/" + SUPABASE.table + (query || "");
     }
 
-    function githubRawUrl() {
-      return "https://raw.githubusercontent.com/" + GITHUB.owner + "/" + GITHUB.repo + "/" + GITHUB.branch + "/" + GITHUB.path;
+    function supabaseHeaders(extra) {
+      return Object.assign({
+        apikey: SUPABASE.key,
+        Authorization: "Bearer " + SUPABASE.key
+      }, extra || {});
     }
 
-    function getToken() {
-      return localStorage.getItem(TOKEN_KEY) || "";
-    }
-
-    function setToken(value) {
-      const trimmed = (value || "").trim();
-      if (trimmed) localStorage.setItem(TOKEN_KEY, trimmed);
-      else localStorage.removeItem(TOKEN_KEY);
-    }
-
-    function authHeaders(token) {
-      return {
-        Accept: "application/vnd.github+json",
-        Authorization: "Bearer " + token,
-        "X-GitHub-Api-Version": "2022-11-28"
-      };
-    }
-
-    function toBase64Utf8(str) {
-      const bytes = new TextEncoder().encode(str);
-      let binary = "";
-      bytes.forEach((b) => { binary += String.fromCharCode(b); });
-      return btoa(binary);
-    }
-
-    function fromBase64Utf8(b64) {
-      const binary = atob(b64.replace(/\n/g, ""));
-      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
+    function nowLabel() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      return pad(d.getHours()) + ":" + pad(d.getMinutes());
     }
 
     function loadLocalCache() {
@@ -631,38 +608,13 @@
       return null;
     }
 
-    async function loadFromGitHub() {
-      const token = getToken();
-
-      if (token) {
-        try {
-          const res = await fetch(githubApiUrl(), { headers: authHeaders(token) });
-          if (res.ok) {
-            const meta = await res.json();
-            dataSha = meta.sha;
-            return migrate(JSON.parse(fromBase64Utf8(meta.content)));
-          }
-          if (res.status !== 404) {
-            throw new Error("GitHub API " + res.status);
-          }
-        } catch (e) {
-          console.warn("GitHub API 读取失败，尝试 Raw 地址", e);
-        }
-      }
-
-      try {
-        const res = await fetch(githubRawUrl() + "?t=" + Date.now());
-        if (res.ok) {
-          return migrate(await res.json());
-        }
-        if (res.status !== 404) {
-          throw new Error("Raw 读取失败 " + res.status);
-        }
-      } catch (e) {
-        console.warn("Raw 读取失败", e);
-      }
-
-      return loadLocalCache() || structuredClone(defaultData);
+    async function loadFromSupabase() {
+      const url = supabaseRestUrl("?id=eq." + encodeURIComponent(SUPABASE.rowId) + "&select=data");
+      const res = await fetch(url, { headers: supabaseHeaders(), cache: "no-store" });
+      if (!res.ok) throw new Error("云端读取失败 " + res.status);
+      const rows = await res.json();
+      if (rows.length && rows[0].data) return migrate(rows[0].data);
+      return null;
     }
 
     function setSyncState(state, message) {
@@ -671,67 +623,67 @@
       renderSyncBar();
     }
 
-    async function refreshSha() {
-      const token = getToken();
-      if (!token) return;
-      const res = await fetch(githubApiUrl(), { headers: authHeaders(token) });
-      if (res.ok) {
-        const meta = await res.json();
-        dataSha = meta.sha;
-      } else if (res.status === 404) {
-        dataSha = null;
-      } else {
-        throw new Error("获取文件版本失败 " + res.status);
-      }
-    }
-
-    async function pushToGitHub() {
-      const token = getToken();
-      if (!token) {
-        setSyncState("local", "仅保存在本机浏览器，设置 Token 后可跨设备同步");
-        return;
-      }
-
-      setSyncState("syncing", "正在同步到 GitHub…");
-
+    async function pushToSupabase() {
+      setSyncState("syncing", "正在同步到云端…");
       try {
-        if (!dataSha) await refreshSha();
-
-        const payload = {
-          message: "Update goals data",
-          content: toBase64Utf8(JSON.stringify(data, null, 2)),
-          branch: GITHUB.branch
-        };
-        if (dataSha) payload.sha = dataSha;
-
-        const res = await fetch(githubApiUrl(), {
-          method: "PUT",
-          headers: Object.assign({ "Content-Type": "application/json" }, authHeaders(token)),
-          body: JSON.stringify(payload)
+        const res = await fetch(supabaseRestUrl(), {
+          method: "POST",
+          headers: supabaseHeaders({
+            "Content-Type": "application/json",
+            Prefer: "resolution=merge-duplicates,return=minimal"
+          }),
+          body: JSON.stringify([{
+            id: SUPABASE.rowId,
+            data: data,
+            updated_at: new Date().toISOString()
+          }])
         });
-
         if (!res.ok) {
           const errText = await res.text();
-          if (res.status === 409) {
-            dataSha = null;
-            await refreshSha();
-            throw new Error("版本冲突，请刷新页面后重试");
-          }
           throw new Error(errText || ("同步失败 " + res.status));
         }
-
-        const result = await res.json();
-        dataSha = result.content.sha;
-        setSyncState("synced", "已同步到 GitHub，换设备打开同一链接即可看到");
+        lastSavedSnapshot = JSON.stringify(data);
+        setSyncState("synced", "已同步到云端 · " + nowLabel());
       } catch (e) {
         console.error(e);
         setSyncState("error", "同步失败：" + (e.message || "未知错误"));
       }
     }
 
-    function scheduleGitHubSave() {
+    function scheduleCloudSave() {
       clearTimeout(saveTimer);
-      saveTimer = setTimeout(() => pushToGitHub(), 1500);
+      saveTimer = setTimeout(() => { saveTimer = null; pushToSupabase(); }, 1200);
+    }
+
+    async function reloadFromCloud() {
+      if (reloading) return;
+      if (saveTimer || syncState === "syncing") return;
+      reloading = true;
+      try {
+        const cloud = await loadFromSupabase();
+        if (cloud) {
+          const snapshot = JSON.stringify(cloud);
+          if (snapshot !== JSON.stringify(data)) {
+            data = cloud;
+            localStorage.setItem(STORAGE_KEY, snapshot);
+            lastSavedSnapshot = snapshot;
+            render();
+          }
+          setSyncState("synced", "已是最新 · " + nowLabel());
+        }
+      } catch (e) {
+        console.error(e);
+        setSyncState("error", "刷新失败：" + (e.message || ""));
+      } finally {
+        reloading = false;
+      }
+    }
+
+    function setupAutoRefresh() {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) reloadFromCloud();
+      });
+      window.addEventListener("focus", () => reloadFromCloud());
     }
 
     function migrate(parsed) {
@@ -763,7 +715,7 @@
 
     function save() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-      scheduleGitHubSave();
+      scheduleCloudSave();
     }
 
     function renderSyncBar() {
@@ -793,82 +745,24 @@
       const actions = document.createElement("div");
       actions.className = "sync-actions";
 
-      const settingsBtn = document.createElement("button");
-      settingsBtn.type = "button";
-      settingsBtn.className = "sync-btn";
-      settingsBtn.textContent = syncPanelOpen ? "收起设置" : "同步设置";
-      settingsBtn.addEventListener("click", () => {
-        syncPanelOpen = !syncPanelOpen;
-        renderSyncBar();
-      });
+      const reloadBtn = document.createElement("button");
+      reloadBtn.type = "button";
+      reloadBtn.className = "sync-btn";
+      reloadBtn.textContent = "刷新数据";
+      reloadBtn.addEventListener("click", () => reloadFromCloud());
 
       const syncBtn = document.createElement("button");
       syncBtn.type = "button";
       syncBtn.className = "sync-btn";
       syncBtn.textContent = "立即同步";
-      syncBtn.addEventListener("click", () => pushToGitHub());
+      syncBtn.addEventListener("click", () => pushToSupabase());
 
-      actions.appendChild(settingsBtn);
+      actions.appendChild(reloadBtn);
       actions.appendChild(syncBtn);
 
       top.appendChild(status);
       top.appendChild(actions);
       bar.appendChild(top);
-
-      if (syncPanelOpen) {
-        const panel = document.createElement("div");
-        panel.className = "sync-panel";
-
-        const label = document.createElement("label");
-        label.textContent = "GitHub Personal Access Token";
-        label.setAttribute("for", "github-token");
-
-        const input = document.createElement("input");
-        input.id = "github-token";
-        input.type = "password";
-        input.placeholder = "粘贴 Token（仅保存在本机浏览器）";
-        input.value = getToken();
-        input.autocomplete = "off";
-
-        const help = document.createElement("p");
-        help.innerHTML =
-          "在 GitHub → Settings → Developer settings → Personal access tokens 创建 Token，" +
-          "勾选 <strong>Contents</strong> 读写权限（公开仓库可用 <code>public_repo</code>）。" +
-          ' <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">去创建 Token</a>';
-
-        const panelActions = document.createElement("div");
-        panelActions.className = "sync-panel-actions";
-
-        const saveTokenBtn = document.createElement("button");
-        saveTokenBtn.type = "button";
-        saveTokenBtn.className = "sync-btn";
-        saveTokenBtn.textContent = "保存 Token";
-        saveTokenBtn.addEventListener("click", () => {
-          setToken(input.value);
-          setSyncState(getToken() ? "synced" : "local", getToken() ? "Token 已保存" : "Token 已清除");
-          if (getToken()) pushToGitHub();
-        });
-
-        const reloadBtn = document.createElement("button");
-        reloadBtn.type = "button";
-        reloadBtn.className = "sync-btn";
-        reloadBtn.textContent = "从 GitHub 重新加载";
-        reloadBtn.addEventListener("click", async () => {
-          setSyncState("loading", "正在重新加载…");
-          data = await loadFromGitHub();
-          render();
-          setSyncState("synced", "已从 GitHub 加载最新数据");
-        });
-
-        panelActions.appendChild(saveTokenBtn);
-        panelActions.appendChild(reloadBtn);
-
-        panel.appendChild(label);
-        panel.appendChild(input);
-        panel.appendChild(help);
-        panel.appendChild(panelActions);
-        bar.appendChild(panel);
-      }
     }
 
     async function boot() {
@@ -876,21 +770,25 @@
       document.getElementById("app").innerHTML = '<div class="boot-loading">正在加载目标数据…</div>';
 
       try {
-        data = await loadFromGitHub();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-        if (getToken()) {
-          setSyncState("synced", "已从 GitHub 加载，修改后会自动同步");
-          if (!dataSha) scheduleGitHubSave();
+        const cloud = await loadFromSupabase();
+        if (cloud) {
+          data = cloud;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+          lastSavedSnapshot = JSON.stringify(data);
+          setSyncState("synced", "已从云端加载，修改后会自动同步");
         } else {
-          setSyncState("local", "只读模式：可查看数据，设置 Token 后才能保存到云端");
+          data = loadLocalCache() || structuredClone(defaultData);
+          render();
+          await pushToSupabase();
         }
       } catch (e) {
         console.error(e);
         data = loadLocalCache() || structuredClone(defaultData);
-        setSyncState("error", "加载失败，已使用本地缓存");
+        setSyncState("error", "云端加载失败，已使用本地缓存：" + (e.message || ""));
       }
 
       render();
+      setupAutoRefresh();
     }
 
     const DONE_ICONS = ["🏆", "🎉", "🌸", "⭐", "🎆"];
